@@ -76,12 +76,14 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
-
+        
+# @classmethod 装饰器用于声明一个类方法：
+# 类方法可以直接通过类名调用，而不需要先创建类的实例
+# 类方法的第一个参数是 cls（代表类本身），而不是 self（代表实例）
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    #vocab_size: int = 50304# 64的倍数
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
@@ -106,7 +108,7 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
-
+        #（1）设置模型参数
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
             'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
@@ -124,7 +126,7 @@ class GPT(nn.Module):
         print(sd.keys())
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
+        # （2）加载huggingface已训练好模型及状态字典
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
@@ -134,6 +136,8 @@ class GPT(nn.Module):
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        
+        # （3）将参数复制到GPT
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
@@ -152,5 +156,6 @@ class GPT(nn.Module):
         return model
 
 # -----------------------------------------------------------------------------
+# 使用类方法创建实例
 model = GPT.from_pretrained('gpt2')
 print("Building the GPT module Framework Successfully !")
