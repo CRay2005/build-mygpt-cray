@@ -77,9 +77,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
         
-# @classmethod 装饰器用于声明一个类方法：
-# 类方法可以直接通过类名调用，而不需要先创建类的实例
-# 类方法的第一个参数是 cls（代表类本身），而不是 self（代表实例）
+#@dataclass 是 Python 中的一个装饰器（decorator），用于自动为类生成特殊方法（如 __init__、__repr__ 等），从而简化类的定义。
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
@@ -87,9 +85,15 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
-
+    '''
+    每个 token 被映射到一个 768 维的向量空间,768 = 12(头数) × 64(每个头的维度)
+    GPT-2 不同版本中的维度：
+    GPT-2 (小型): 768 维
+    GPT-2 Medium: 1024 维
+    GPT-2 Large: 1280 维
+    GPT-2 XL: 1600 维
+    '''
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -101,6 +105,33 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # forward the token and posisition embeddings
+        # 生成位置索引 [0, 1, 2, ..., T-1]
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        # 位置嵌入，将位置转换为向量
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        # 词嵌入，将token ID转换为向量
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+        # forward the blocks of the transformer
+        # 依次通过每个 Transformer 块
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        # 最后的层归一化
+        x = self.transformer.ln_f(x)
+        # 通过语言模型头部转换为词表大小的logits
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        return logits
+
+    # @classmethod 装饰器用于声明一个类方法：
+    # 类方法可以直接通过类名调用，而不需要先创建类的实例
+    # 类方法的第一个参数是 cls（代表类本身），而不是 self（代表实例）
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -123,7 +154,7 @@ class GPT(nn.Module):
         model = GPT(config)
         sd = model.state_dict()
         print("inint sd.keys()")
-        print(sd.keys())
+        # print(sd.keys())
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
         # （2）加载huggingface已训练好模型及状态字典
@@ -157,5 +188,74 @@ class GPT(nn.Module):
 
 # -----------------------------------------------------------------------------
 # 使用类方法创建实例
-model = GPT.from_pretrained('gpt2')
+
+# attempt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+     device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+     device = "mps"
+print(f"using device: {device}")
+
+
+num_return_sequences = 5
+max_length = 30
+
+# 从gpt2加载已训练好的参数
+# model = GPT.from_pretrained('gpt2')
+# model.to('cuda')
+
+model = GPT(GPTConfig())
+model.eval()
+model.to(device)
 print("Building the GPT module Framework Successfully !")
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+print(tokens)
+# x = tokens.to('cuda')
+x = tokens.to(device)
+# generate! right now x is (B, T) where B = 5, T = 8
+# set the seed to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab_size)
+        # take the logits at the last position
+        # 只取最后一个位置的预测 [:, -1, :]
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        print(topk_probs)
+        print(topk_indices)
+
+        # select a token from the top-k probabilities
+        # note: multinomial does not demand the input to sum to 1
+        # 使用 top-k 采样而不总是选择概率最高的token,增加文本多样性
+        ix = torch.multinomial(topk_probs, 1) # (B, 1)
+        print(ix)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        print(xcol)
+        # 5个生成序列的第一个token分别如下，index值实际上也是token值
+        # not，and，and，I，a
+        for i in range(num_return_sequences):
+            print(enc.decode(xcol[i].tolist()))
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+        
+    break
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
