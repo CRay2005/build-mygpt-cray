@@ -40,11 +40,17 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1)
+        #y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # 调用PyTorch 提供的底层高效内核,替换上面的4行语句
+        # ​​高效自注意力（Self-Attention）实现​​，专门优化了 Transformer 类模型的核心计算
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         # 最终输出投影,恢复原始维度
@@ -246,11 +252,8 @@ class DataLoaderLite:
 
 # -----------------------------------------------------------------------------
 
-
-
-
 # 使用类方法创建实例
-
+import time
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -264,6 +267,9 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 train_loader = DataLoaderLite(B=4, T=32)
+
+#train_loader = DataLoaderLite(B=16, T=1024)
+torch.set_float32_matmul_precision('high')
 '''
 # get a data batch
 import tiktoken
@@ -285,7 +291,10 @@ y = buf[1:].view(B, T)
 # model.to('cuda')
 
 # get logits
-model = GPT(GPTConfig())
+#model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
+# ​​模型编译优化接口​​，用于显著提升模型训练和推理速度（通常可加速 10%-30%）
+model = torch.compile(model)
 model.to(device)
 # logits, loss = model(x, y)
 # print(loss)
@@ -293,13 +302,26 @@ model.to(device)
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    #logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    # print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize() # wait for the GPU to finish work
+    t1 = time.time()
+    #dt = (t1 - t0)*1000 # time difference in miliseconds
+    #tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    #print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {i:4d} | loss: {loss.item():.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; 
 sys.exit(0)
